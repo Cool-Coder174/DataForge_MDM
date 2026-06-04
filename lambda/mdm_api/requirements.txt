@@ -1,0 +1,3 @@
+# psycopg2 for RDS PostgreSQL access (binary wheel bundles libpq).
+# Falls back to the runtime-provided sqlite3 when RDS is disabled.
+psycopg2-binary==2.9.9

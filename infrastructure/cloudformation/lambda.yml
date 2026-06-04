@@ -1,0 +1,126 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  DataForge MDM - Lambda functions: file_validator, mdm_api, alert_handler.
+  Code is loaded from the deploy bucket (packaged by scripts/deploy.sh).
+
+Parameters:
+  ProjectName:
+    Type: String
+  DeployBucket:
+    Type: String
+  FileValidatorKey:
+    Type: String
+    Default: lambda/file_validator.zip
+  MdmApiKey:
+    Type: String
+    Default: lambda/mdm_api.zip
+  AlertHandlerKey:
+    Type: String
+    Default: lambda/alert_handler.zip
+  LambdaRoleArn:
+    Type: String
+  DataBucketName:
+    Type: String
+  AlertTopicArn:
+    Type: String
+  RdsSecretArn:
+    Type: String
+    Default: ""
+  RdsProxyEndpoint:
+    Type: String
+    Default: ""
+
+Resources:
+  FileValidatorFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "${ProjectName}-file-validator"
+      Runtime: python3.11
+      Handler: app.handler
+      Timeout: 60
+      MemorySize: 256
+      Role: !Ref LambdaRoleArn
+      Code:
+        S3Bucket: !Ref DeployBucket
+        S3Key: !Ref FileValidatorKey
+      Environment:
+        Variables:
+          DATA_BUCKET: !Ref DataBucketName
+          PROJECT_NAME: !Ref ProjectName
+
+  MdmApiFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "${ProjectName}-mdm-api"
+      Runtime: python3.11
+      Handler: app.handler
+      Timeout: 30
+      MemorySize: 512
+      Role: !Ref LambdaRoleArn
+      Code:
+        S3Bucket: !Ref DeployBucket
+        S3Key: !Ref MdmApiKey
+      Environment:
+        Variables:
+          PROJECT_NAME: !Ref ProjectName
+          DATA_BUCKET: !Ref DataBucketName
+          RDS_SECRET_ARN: !Ref RdsSecretArn
+          RDS_ENDPOINT: !Ref RdsProxyEndpoint
+          # When RDS is disabled, the function transparently falls back to an
+          # in-memory/SQLite store so the API still demos. See app.py.
+          MDM_FALLBACK: "sqlite"
+
+  AlertHandlerFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "${ProjectName}-alert-handler"
+      Runtime: python3.11
+      Handler: app.handler
+      Timeout: 30
+      MemorySize: 128
+      Role: !Ref LambdaRoleArn
+      Code:
+        S3Bucket: !Ref DeployBucket
+        S3Key: !Ref AlertHandlerKey
+      Environment:
+        Variables:
+          PROJECT_NAME: !Ref ProjectName
+          ALERT_TOPIC_ARN: !Ref AlertTopicArn
+
+  # Allow API Gateway to invoke the MDM API function.
+  MdmApiInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref MdmApiFunction
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+
+  # Let the SNS alert topic invoke the alert formatter.
+  AlertHandlerSnsPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref AlertHandlerFunction
+      Action: lambda:InvokeFunction
+      Principal: sns.amazonaws.com
+      SourceArn: !Ref AlertTopicArn
+
+  # Subscribe the alert formatter to the SNS topic so it can enrich alerts.
+  AlertHandlerSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      TopicArn: !Ref AlertTopicArn
+      Protocol: lambda
+      Endpoint: !GetAtt AlertHandlerFunction.Arn
+
+Outputs:
+  FileValidatorArn:
+    Value: !GetAtt FileValidatorFunction.Arn
+    Export: { Name: !Sub "${ProjectName}-file-validator-arn" }
+  MdmApiArn:
+    Value: !GetAtt MdmApiFunction.Arn
+    Export: { Name: !Sub "${ProjectName}-mdm-api-arn" }
+  MdmApiName:
+    Value: !Ref MdmApiFunction
+  AlertHandlerArn:
+    Value: !GetAtt AlertHandlerFunction.Arn
+    Export: { Name: !Sub "${ProjectName}-alert-handler-arn" }

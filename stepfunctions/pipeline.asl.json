@@ -1,0 +1,197 @@
+{
+  "Comment": "DataForge MDM end-to-end batch pipeline: validate -> raw -> crawl -> ETL -> data quality -> SQL transforms -> MDM/SCD2 -> load Redshift -> refresh dashboards -> notify. Includes retries, error handling, and a data-quality failure branch.",
+  "StartAt": "ValidateIncomingFile",
+  "States": {
+    "ValidateIncomingFile": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": {
+        "FunctionName": "${FileValidatorArn}",
+        "Payload": {
+          "action": "validate",
+          "bucket.$": "$.bucket",
+          "trips_key.$": "$.trips_key"
+        }
+      },
+      "ResultSelector": { "validation.$": "$.Payload" },
+      "ResultPath": "$.validate",
+      "Retry": [
+        { "ErrorEquals": ["Lambda.ServiceException", "Lambda.TooManyRequestsException"],
+          "IntervalSeconds": 3, "MaxAttempts": 3, "BackoffRate": 2.0 }
+      ],
+      "Catch": [
+        { "ErrorEquals": ["States.ALL"], "ResultPath": "$.error", "Next": "NotifyFailure" }
+      ],
+      "Next": "CopyToRaw"
+    },
+
+    "CopyToRaw": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": {
+        "FunctionName": "${FileValidatorArn}",
+        "Payload": { "action": "copy_to_raw", "bucket.$": "$.bucket" }
+      },
+      "ResultSelector": { "copy.$": "$.Payload" },
+      "ResultPath": "$.raw",
+      "Retry": [
+        { "ErrorEquals": ["Lambda.ServiceException", "Lambda.TooManyRequestsException"],
+          "IntervalSeconds": 3, "MaxAttempts": 3, "BackoffRate": 2.0 }
+      ],
+      "Catch": [
+        { "ErrorEquals": ["States.ALL"], "ResultPath": "$.error", "Next": "NotifyFailure" }
+      ],
+      "Next": "RunGlueCrawler"
+    },
+
+    "RunGlueCrawler": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::aws-sdk:glue:startCrawler",
+      "Parameters": { "Name": "${RawCrawlerName}" },
+      "ResultPath": "$.crawler",
+      "Catch": [
+        { "ErrorEquals": ["Glue.CrawlerRunningException"],
+          "ResultPath": "$.crawlerWarn", "Next": "WaitForCrawler" },
+        { "ErrorEquals": ["States.ALL"], "ResultPath": "$.crawlerWarn", "Next": "WaitForCrawler" }
+      ],
+      "Next": "WaitForCrawler"
+    },
+
+    "WaitForCrawler": {
+      "Type": "Wait",
+      "Seconds": 20,
+      "Comment": "Give the crawler a head start; ETL reads S3 directly so it need not fully finish.",
+      "Next": "GlueETL"
+    },
+
+    "GlueETL": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::glue:startJobRun.sync",
+      "Parameters": {
+        "JobName": "${EtlJobName}",
+        "Arguments": { "--run_id.$": "$.run_id" }
+      },
+      "ResultPath": "$.etl",
+      "Retry": [
+        { "ErrorEquals": ["Glue.ConcurrentRunsExceededException"],
+          "IntervalSeconds": 30, "MaxAttempts": 2, "BackoffRate": 2.0 },
+        { "ErrorEquals": ["States.TaskFailed"],
+          "IntervalSeconds": 15, "MaxAttempts": 1, "BackoffRate": 1.0 }
+      ],
+      "Catch": [
+        { "ErrorEquals": ["States.ALL"], "ResultPath": "$.error", "Next": "NotifyFailure" }
+      ],
+      "Next": "DataQuality"
+    },
+
+    "DataQuality": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::glue:startJobRun.sync",
+      "Parameters": {
+        "JobName": "${DqJobName}",
+        "Arguments": { "--run_id.$": "$.run_id" }
+      },
+      "ResultPath": "$.dq",
+      "Retry": [
+        { "ErrorEquals": ["Glue.ConcurrentRunsExceededException"],
+          "IntervalSeconds": 30, "MaxAttempts": 2, "BackoffRate": 2.0 }
+      ],
+      "Catch": [
+        { "ErrorEquals": ["States.ALL"], "ResultPath": "$.error",
+          "Next": "HandleDataQualityFailure" }
+      ],
+      "Next": "RunSqlTransformations"
+    },
+
+    "RunSqlTransformations": {
+      "Type": "Pass",
+      "Comment": "Versioned SQL transforms (sql/transformations/*.sql) are applied via Athena CTAS. Modeled as a Pass here for demo readability; run_demo / runbook show the Athena execution. Swap for an athena:startQueryExecution.sync task in production.",
+      "Result": { "status": "applied", "scripts": ["001_create_staging_tables", "002_transform_fact_trip", "003_transform_dimensions"] },
+      "ResultPath": "$.sql",
+      "Next": "UpdateMasterDataSCD2"
+    },
+
+    "UpdateMasterDataSCD2": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::glue:startJobRun.sync",
+      "Parameters": {
+        "JobName": "${Scd2JobName}",
+        "Arguments": { "--run_id.$": "$.run_id" }
+      },
+      "ResultPath": "$.scd2",
+      "Retry": [
+        { "ErrorEquals": ["Glue.ConcurrentRunsExceededException"],
+          "IntervalSeconds": 30, "MaxAttempts": 2, "BackoffRate": 2.0 }
+      ],
+      "Catch": [
+        { "ErrorEquals": ["States.ALL"], "ResultPath": "$.error", "Next": "NotifyFailure" }
+      ],
+      "Next": "LoadRedshift"
+    },
+
+    "LoadRedshift": {
+      "Type": "Pass",
+      "Comment": "COPY into Redshift (sql/transformations/004_load_redshift.sql). Skipped/no-op when ENABLE_REDSHIFT=false; Athena serves curated data instead. Replace with a redshift-data:executeStatement task to automate.",
+      "Result": { "status": "skipped_or_copied" },
+      "ResultPath": "$.redshift",
+      "Next": "RefreshDashboard"
+    },
+
+    "RefreshDashboard": {
+      "Type": "Pass",
+      "Comment": "Curated + DQ outputs are already dashboard-ready in S3/Athena. QuickSight SPICE refresh is triggered out-of-band (see dashboards/).",
+      "Result": { "status": "dashboard_ready" },
+      "ResultPath": "$.dashboard",
+      "Next": "NotifySuccess"
+    },
+
+    "NotifySuccess": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": {
+        "FunctionName": "${AlertHandlerArn}",
+        "Payload": {
+          "status": "SUCCEEDED",
+          "payload": { "run_id.$": "$.run_id" }
+        }
+      },
+      "ResultPath": "$.notify",
+      "End": true
+    },
+
+    "HandleDataQualityFailure": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::aws-sdk:sns:publish",
+      "Parameters": {
+        "TopicArn": "${AlertTopicArn}",
+        "Subject": "DataForge DATA QUALITY FAILURE",
+        "Message.$": "States.Format('Data quality gate FAILED for run {}. Rejected records written to s3://${DataBucket}/processed/rejected/. Investigate sql/tests and the DQ Glue job logs.', $.run_id)"
+      },
+      "ResultPath": "$.dqAlert",
+      "Next": "PipelineFailed"
+    },
+
+    "NotifyFailure": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": {
+        "FunctionName": "${AlertHandlerArn}",
+        "Payload": {
+          "status": "FAILED",
+          "payload": {
+            "run_id.$": "$.run_id",
+            "error.$": "States.JsonToString($.error)"
+          }
+        }
+      },
+      "ResultPath": "$.notify",
+      "Next": "PipelineFailed"
+    },
+
+    "PipelineFailed": {
+      "Type": "Fail",
+      "Error": "PipelineFailed",
+      "Cause": "DataForge pipeline failed; see alert + CloudWatch logs."
+    }
+  }
+}

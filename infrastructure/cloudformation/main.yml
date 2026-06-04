@@ -1,0 +1,148 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  DataForge MDM - ROOT stack. Nests all platform stacks (S3, IAM, RDS, Redshift,
+  Glue, Monitoring, Lambda, API Gateway, Step Functions, QuickSight).
+  Nested template + code artifacts are uploaded to the deploy bucket by
+  scripts/deploy.sh, which also passes TemplateBaseUrl.
+
+Parameters:
+  ProjectName: { Type: String }
+  DataBucketName: { Type: String }
+  AlertEmail: { Type: String }
+  RdsDatabase: { Type: String, Default: mdm }
+  RdsUser: { Type: String, Default: mdm_admin }
+  RedshiftDatabase: { Type: String, Default: dataforge }
+  RedshiftUser: { Type: String, Default: dataforge_admin }
+  DeployBucket:
+    Type: String
+    Description: Bucket holding nested templates, Lambda zips, Glue scripts, ASL.
+  TemplateBaseUrl:
+    Type: String
+    Description: https://<deploybucket>.s3.<region>.amazonaws.com/cfn URL prefix.
+  EnableRds: { Type: String, AllowedValues: ["true", "false"], Default: "true" }
+  EnableRedshift: { Type: String, AllowedValues: ["true", "false"], Default: "false" }
+  EnableQuickSight: { Type: String, AllowedValues: ["true", "false"], Default: "false" }
+  UseDelta: { Type: String, AllowedValues: ["true", "false"], Default: "false" }
+  QuickSightPrincipalArn: { Type: String, Default: "" }
+
+Conditions:
+  RdsEnabled: !Equals [!Ref EnableRds, "true"]
+
+Resources:
+  S3Stack:
+    Type: AWS::CloudFormation::Stack
+    Properties:
+      TemplateURL: !Sub "${TemplateBaseUrl}/s3.yml"
+      Parameters:
+        ProjectName: !Ref ProjectName
+        DataBucketName: !Ref DataBucketName
+
+  IamStack:
+    Type: AWS::CloudFormation::Stack
+    Properties:
+      TemplateURL: !Sub "${TemplateBaseUrl}/iam.yml"
+      Parameters:
+        ProjectName: !Ref ProjectName
+        DataBucketArn: !GetAtt S3Stack.Outputs.DataBucketArn
+
+  RdsStack:
+    Type: AWS::CloudFormation::Stack
+    Properties:
+      TemplateURL: !Sub "${TemplateBaseUrl}/rds.yml"
+      Parameters:
+        ProjectName: !Ref ProjectName
+        RdsDatabase: !Ref RdsDatabase
+        RdsUser: !Ref RdsUser
+        EnableRds: !Ref EnableRds
+
+  RedshiftStack:
+    Type: AWS::CloudFormation::Stack
+    Properties:
+      TemplateURL: !Sub "${TemplateBaseUrl}/redshift.yml"
+      Parameters:
+        ProjectName: !Ref ProjectName
+        RedshiftDatabase: !Ref RedshiftDatabase
+        RedshiftUser: !Ref RedshiftUser
+        EnableRedshift: !Ref EnableRedshift
+
+  GlueStack:
+    Type: AWS::CloudFormation::Stack
+    Properties:
+      TemplateURL: !Sub "${TemplateBaseUrl}/glue.yml"
+      Parameters:
+        ProjectName: !Ref ProjectName
+        DataBucketName: !GetAtt S3Stack.Outputs.DataBucketName
+        GlueRoleArn: !GetAtt IamStack.Outputs.GlueJobRoleArn
+        DeployBucket: !Ref DeployBucket
+        UseDelta: !Ref UseDelta
+
+  MonitoringStack:
+    Type: AWS::CloudFormation::Stack
+    Properties:
+      TemplateURL: !Sub "${TemplateBaseUrl}/monitoring.yml"
+      Parameters:
+        ProjectName: !Ref ProjectName
+        AlertEmail: !Ref AlertEmail
+        EtlJobName: !GetAtt GlueStack.Outputs.BatchEtlJobName
+        DqJobName: !GetAtt GlueStack.Outputs.DataQualityJobName
+
+  LambdaStack:
+    Type: AWS::CloudFormation::Stack
+    Properties:
+      TemplateURL: !Sub "${TemplateBaseUrl}/lambda.yml"
+      Parameters:
+        ProjectName: !Ref ProjectName
+        DeployBucket: !Ref DeployBucket
+        LambdaRoleArn: !GetAtt IamStack.Outputs.LambdaExecutionRoleArn
+        DataBucketName: !GetAtt S3Stack.Outputs.DataBucketName
+        AlertTopicArn: !GetAtt MonitoringStack.Outputs.AlertTopicArn
+        RdsSecretArn: !If [RdsEnabled, !GetAtt RdsStack.Outputs.RdsSecretArn, ""]
+        RdsProxyEndpoint: !If [RdsEnabled, !GetAtt RdsStack.Outputs.RdsEndpoint, ""]
+
+  ApiGatewayStack:
+    Type: AWS::CloudFormation::Stack
+    Properties:
+      TemplateURL: !Sub "${TemplateBaseUrl}/apigateway.yml"
+      Parameters:
+        ProjectName: !Ref ProjectName
+        MdmApiArn: !GetAtt LambdaStack.Outputs.MdmApiArn
+
+  StepFunctionsStack:
+    Type: AWS::CloudFormation::Stack
+    Properties:
+      TemplateURL: !Sub "${TemplateBaseUrl}/stepfunctions.yml"
+      Parameters:
+        ProjectName: !Ref ProjectName
+        StatesRoleArn: !GetAtt IamStack.Outputs.StatesExecutionRoleArn
+        DefinitionBucket: !Ref DeployBucket
+        DataBucketName: !GetAtt S3Stack.Outputs.DataBucketName
+        FileValidatorArn: !GetAtt LambdaStack.Outputs.FileValidatorArn
+        AlertHandlerArn: !GetAtt LambdaStack.Outputs.AlertHandlerArn
+        AlertTopicArn: !GetAtt MonitoringStack.Outputs.AlertTopicArn
+        RawCrawlerName: !GetAtt GlueStack.Outputs.RawCrawlerName
+        EtlJobName: !GetAtt GlueStack.Outputs.BatchEtlJobName
+        DqJobName: !GetAtt GlueStack.Outputs.DataQualityJobName
+        Scd2JobName: !GetAtt GlueStack.Outputs.Scd2JobName
+
+  QuickSightStack:
+    Type: AWS::CloudFormation::Stack
+    Properties:
+      TemplateURL: !Sub "${TemplateBaseUrl}/quicksight.yml"
+      Parameters:
+        ProjectName: !Ref ProjectName
+        EnableQuickSight: !Ref EnableQuickSight
+        QuickSightPrincipalArn: !Ref QuickSightPrincipalArn
+
+Outputs:
+  DataBucket:
+    Value: !GetAtt S3Stack.Outputs.DataBucketName
+  ApiBaseUrl:
+    Value: !GetAtt ApiGatewayStack.Outputs.ApiBaseUrl
+  StateMachineArn:
+    Value: !GetAtt StepFunctionsStack.Outputs.StateMachineArn
+  AlertTopicArn:
+    Value: !GetAtt MonitoringStack.Outputs.AlertTopicArn
+  CuratedDatabase:
+    Value: !GetAtt GlueStack.Outputs.CuratedDatabaseName
+  MasterDatabase:
+    Value: !GetAtt GlueStack.Outputs.MasterDatabaseName

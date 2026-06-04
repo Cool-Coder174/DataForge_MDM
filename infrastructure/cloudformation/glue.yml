@@ -1,0 +1,144 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  DataForge MDM - Glue Data Catalog databases, crawlers, and ETL/DQ/SCD2 jobs.
+
+Parameters:
+  ProjectName:
+    Type: String
+  DataBucketName:
+    Type: String
+  GlueRoleArn:
+    Type: String
+  DeployBucket:
+    Type: String
+    Description: Bucket holding packaged Glue scripts (glue_jobs/*.py).
+  ScriptPrefix:
+    Type: String
+    Default: glue-scripts
+  UseDelta:
+    Type: String
+    AllowedValues: ["true", "false"]
+    Default: "false"
+
+Resources:
+  CuratedDatabase:
+    Type: AWS::Glue::Database
+    Properties:
+      CatalogId: !Ref AWS::AccountId
+      DatabaseInput:
+        Name: !Sub "${ProjectName}_curated"
+        Description: Analytics-ready curated tables (fact_trip, dims).
+
+  MasterDatabase:
+    Type: AWS::Glue::Database
+    Properties:
+      CatalogId: !Ref AWS::AccountId
+      DatabaseInput:
+        Name: !Sub "${ProjectName}_master"
+        Description: Golden records + SCD2 master snapshots.
+
+  RawCrawler:
+    Type: AWS::Glue::Crawler
+    Properties:
+      Name: !Sub "${ProjectName}-raw-crawler"
+      Role: !Ref GlueRoleArn
+      DatabaseName: !Ref CuratedDatabase
+      Targets:
+        S3Targets:
+          - Path: !Sub "s3://${DataBucketName}/raw/"
+      SchemaChangePolicy:
+        UpdateBehavior: UPDATE_IN_DATABASE
+        DeleteBehavior: LOG
+      Configuration: '{"Version":1.0,"CrawlerOutput":{"Partitions":{"AddOrUpdateBehavior":"InheritFromTable"}}}'
+
+  CuratedCrawler:
+    Type: AWS::Glue::Crawler
+    Properties:
+      Name: !Sub "${ProjectName}-curated-crawler"
+      Role: !Ref GlueRoleArn
+      DatabaseName: !Ref CuratedDatabase
+      Targets:
+        S3Targets:
+          - Path: !Sub "s3://${DataBucketName}/curated/"
+
+  # ----------------------------------------------------------- ETL job
+  BatchEtlJob:
+    Type: AWS::Glue::Job
+    Properties:
+      Name: !Sub "${ProjectName}-batch-etl"
+      Role: !Ref GlueRoleArn
+      GlueVersion: "4.0"
+      WorkerType: G.1X
+      NumberOfWorkers: 2
+      ExecutionProperty:
+        MaxConcurrentRuns: 1
+      Command:
+        Name: glueetl
+        PythonVersion: "3"
+        ScriptLocation: !Sub "s3://${DeployBucket}/${ScriptPrefix}/batch_etl.py"
+      DefaultArguments:
+        "--DATA_BUCKET": !Ref DataBucketName
+        "--PROJECT_NAME": !Ref ProjectName
+        "--USE_DELTA": !Ref UseDelta
+        "--job-language": "python"
+        "--enable-metrics": "true"
+        "--enable-continuous-cloudwatch-log": "true"
+        "--TempDir": !Sub "s3://${DataBucketName}/glue-temp/"
+
+  # ----------------------------------------------------------- DQ job
+  DataQualityJob:
+    Type: AWS::Glue::Job
+    Properties:
+      Name: !Sub "${ProjectName}-data-quality"
+      Role: !Ref GlueRoleArn
+      GlueVersion: "4.0"
+      WorkerType: G.1X
+      NumberOfWorkers: 2
+      Command:
+        Name: glueetl
+        PythonVersion: "3"
+        ScriptLocation: !Sub "s3://${DeployBucket}/${ScriptPrefix}/data_quality.py"
+      DefaultArguments:
+        "--DATA_BUCKET": !Ref DataBucketName
+        "--PROJECT_NAME": !Ref ProjectName
+        "--DQ_THRESHOLD": "0.95"
+        "--TempDir": !Sub "s3://${DataBucketName}/glue-temp/"
+
+  # ----------------------------------------------------------- SCD2 job
+  Scd2UpsertJob:
+    Type: AWS::Glue::Job
+    Properties:
+      Name: !Sub "${ProjectName}-scd2-upsert"
+      Role: !Ref GlueRoleArn
+      GlueVersion: "4.0"
+      WorkerType: G.1X
+      NumberOfWorkers: 2
+      Command:
+        Name: glueetl
+        PythonVersion: "3"
+        ScriptLocation: !Sub "s3://${DeployBucket}/${ScriptPrefix}/scd2_upsert.py"
+      DefaultArguments:
+        "--DATA_BUCKET": !Ref DataBucketName
+        "--PROJECT_NAME": !Ref ProjectName
+        "--USE_DELTA": !Ref UseDelta
+        "--TempDir": !Sub "s3://${DataBucketName}/glue-temp/"
+
+Outputs:
+  CuratedDatabaseName:
+    Value: !Ref CuratedDatabase
+    Export: { Name: !Sub "${ProjectName}-curated-db" }
+  MasterDatabaseName:
+    Value: !Ref MasterDatabase
+    Export: { Name: !Sub "${ProjectName}-master-db" }
+  RawCrawlerName:
+    Value: !Ref RawCrawler
+    Export: { Name: !Sub "${ProjectName}-raw-crawler" }
+  BatchEtlJobName:
+    Value: !Ref BatchEtlJob
+    Export: { Name: !Sub "${ProjectName}-etl-job" }
+  DataQualityJobName:
+    Value: !Ref DataQualityJob
+    Export: { Name: !Sub "${ProjectName}-dq-job" }
+  Scd2JobName:
+    Value: !Ref Scd2UpsertJob
+    Export: { Name: !Sub "${ProjectName}-scd2-job" }

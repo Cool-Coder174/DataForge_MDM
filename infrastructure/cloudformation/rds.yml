@@ -1,0 +1,83 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  DataForge MDM - RDS PostgreSQL (MDM operational store). Smallest instance,
+  publicly accessible for demo simplicity (tighten for production). The master
+  password is generated and stored in Secrets Manager.
+
+Parameters:
+  ProjectName:
+    Type: String
+  RdsDatabase:
+    Type: String
+    Default: mdm
+  RdsUser:
+    Type: String
+    Default: mdm_admin
+  EnableRds:
+    Type: String
+    AllowedValues: ["true", "false"]
+    Default: "true"
+
+Conditions:
+  CreateRds: !Equals [!Ref EnableRds, "true"]
+
+Resources:
+  DbSecret:
+    Type: AWS::SecretsManager::Secret
+    Condition: CreateRds
+    Properties:
+      Name: !Sub "${ProjectName}/rds/master"
+      Description: RDS PostgreSQL master credentials for MDM.
+      GenerateSecretString:
+        SecretStringTemplate: !Sub '{"username":"${RdsUser}"}'
+        GenerateStringKey: password
+        PasswordLength: 20
+        ExcludePunctuation: true
+
+  DbSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Condition: CreateRds
+    Properties:
+      GroupDescription: !Sub "${ProjectName} RDS access (demo - open 5432)"
+      SecurityGroupIngress:
+        # NOTE: demo only. Restrict to your IP / Lambda SG in production.
+        - IpProtocol: tcp
+          FromPort: 5432
+          ToPort: 5432
+          CidrIp: 0.0.0.0/0
+
+  DbInstance:
+    Type: AWS::RDS::DBInstance
+    Condition: CreateRds
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      DBInstanceIdentifier: !Sub "${ProjectName}-mdm-pg"
+      Engine: postgres
+      EngineVersion: "16.3"
+      DBInstanceClass: db.t3.micro
+      AllocatedStorage: "20"
+      StorageType: gp3
+      DBName: !Ref RdsDatabase
+      MasterUsername: !Sub "{{resolve:secretsmanager:${DbSecret}:SecretString:username}}"
+      MasterUserPassword: !Sub "{{resolve:secretsmanager:${DbSecret}:SecretString:password}}"
+      PubliclyAccessible: true
+      MultiAZ: false
+      BackupRetentionPeriod: 0
+      VPCSecurityGroups: [!GetAtt DbSecurityGroup.GroupId]
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+
+Outputs:
+  RdsEndpoint:
+    Condition: CreateRds
+    Value: !GetAtt DbInstance.Endpoint.Address
+    Export: { Name: !Sub "${ProjectName}-rds-endpoint" }
+  RdsPort:
+    Condition: CreateRds
+    Value: !GetAtt DbInstance.Endpoint.Port
+  RdsSecretArn:
+    Condition: CreateRds
+    Value: !Ref DbSecret
+    Export: { Name: !Sub "${ProjectName}-rds-secret-arn" }

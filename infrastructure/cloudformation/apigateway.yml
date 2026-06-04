@@ -1,0 +1,83 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  DataForge MDM - API Gateway (REST) fronting the mdm_api Lambda with a greedy
+  proxy. Routing is handled inside the Lambda (see lambda/mdm_api/app.py).
+
+Parameters:
+  ProjectName:
+    Type: String
+  MdmApiArn:
+    Type: String
+  StageName:
+    Type: String
+    Default: prod
+
+Resources:
+  RestApi:
+    Type: AWS::ApiGateway::RestApi
+    Properties:
+      Name: !Sub "${ProjectName}-mdm-api"
+      Description: Master Data Management CRUD + match/merge + SCD2 history.
+      EndpointConfiguration:
+        Types: [REGIONAL]
+
+  # /{proxy+} catch-all resource
+  ProxyResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref RestApi
+      ParentId: !GetAtt RestApi.RootResourceId
+      PathPart: "{proxy+}"
+
+  ProxyAnyMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref RestApi
+      ResourceId: !Ref ProxyResource
+      HttpMethod: ANY
+      AuthorizationType: NONE
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub "arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${MdmApiArn}/invocations"
+
+  # Root method so GET / also works
+  RootAnyMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref RestApi
+      ResourceId: !GetAtt RestApi.RootResourceId
+      HttpMethod: ANY
+      AuthorizationType: NONE
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub "arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${MdmApiArn}/invocations"
+
+  Deployment:
+    Type: AWS::ApiGateway::Deployment
+    DependsOn: [ProxyAnyMethod, RootAnyMethod]
+    Properties:
+      RestApiId: !Ref RestApi
+
+  Stage:
+    Type: AWS::ApiGateway::Stage
+    Properties:
+      RestApiId: !Ref RestApi
+      DeploymentId: !Ref Deployment
+      StageName: !Ref StageName
+      MethodSettings:
+        - ResourcePath: "/*"
+          HttpMethod: "*"
+          MetricsEnabled: true
+          DataTraceEnabled: false
+          LoggingLevel: ERROR
+
+Outputs:
+  ApiBaseUrl:
+    Description: Base URL for the MDM REST API.
+    Value: !Sub "https://${RestApi}.execute-api.${AWS::Region}.amazonaws.com/${StageName}"
+    Export: { Name: !Sub "${ProjectName}-api-base-url" }
+  RestApiId:
+    Value: !Ref RestApi
+    Export: { Name: !Sub "${ProjectName}-rest-api-id" }

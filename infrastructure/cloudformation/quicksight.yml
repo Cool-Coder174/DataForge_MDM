@@ -1,0 +1,52 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  DataForge MDM - QuickSight (OPT-IN). QuickSight account signup + user
+  management cannot be fully automated via CloudFormation, so this template only
+  provisions an Athena-backed DataSource when ENABLE_QUICKSIGHT=true. Datasets,
+  analyses, and dashboards are created via the manual guides in dashboards/.
+
+Parameters:
+  ProjectName:
+    Type: String
+  EnableQuickSight:
+    Type: String
+    AllowedValues: ["true", "false"]
+    Default: "false"
+  QuickSightPrincipalArn:
+    Type: String
+    Default: ""
+    Description: ARN of the QuickSight user that owns the data source (required if enabled).
+
+Conditions:
+  CreateQs: !And
+    - !Equals [!Ref EnableQuickSight, "true"]
+    - !Not [!Equals [!Ref QuickSightPrincipalArn, ""]]
+
+Resources:
+  AthenaDataSource:
+    Type: AWS::QuickSight::DataSource
+    Condition: CreateQs
+    Properties:
+      AwsAccountId: !Ref AWS::AccountId
+      DataSourceId: !Sub "${ProjectName}-athena"
+      Name: !Sub "${ProjectName} Athena"
+      Type: ATHENA
+      DataSourceParameters:
+        AthenaParameters:
+          WorkGroup: primary
+      Permissions:
+        - Principal: !Ref QuickSightPrincipalArn
+          Actions:
+            - quicksight:DescribeDataSource
+            - quicksight:DescribeDataSourcePermissions
+            - quicksight:PassDataSource
+            - quicksight:UpdateDataSource
+            - quicksight:DeleteDataSource
+            - quicksight:UpdateDataSourcePermissions
+
+Outputs:
+  Note:
+    Value: !If
+      - CreateQs
+      - !Sub "QuickSight Athena data source ${ProjectName}-athena created. Build datasets via dashboards/ guides."
+      - "QuickSight disabled. Follow dashboards/*.md for manual setup."

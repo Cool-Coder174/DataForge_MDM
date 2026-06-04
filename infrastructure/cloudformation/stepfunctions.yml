@@ -1,0 +1,58 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  DataForge MDM - Step Functions state machine orchestrating the end-to-end
+  batch pipeline. Definition is loaded from S3 (stepfunctions/pipeline.asl.json)
+  with ARNs/job-names injected via DefinitionSubstitutions.
+
+Parameters:
+  ProjectName:
+    Type: String
+  StatesRoleArn:
+    Type: String
+  DefinitionBucket:
+    Type: String
+  DefinitionKey:
+    Type: String
+    Default: stepfunctions/pipeline.asl.json
+  DataBucketName:
+    Type: String
+  FileValidatorArn:
+    Type: String
+  AlertHandlerArn:
+    Type: String
+  AlertTopicArn:
+    Type: String
+  RawCrawlerName:
+    Type: String
+  EtlJobName:
+    Type: String
+  DqJobName:
+    Type: String
+  Scd2JobName:
+    Type: String
+
+Resources:
+  PipelineStateMachine:
+    Type: AWS::StepFunctions::StateMachine
+    Properties:
+      StateMachineName: !Sub "${ProjectName}-pipeline"
+      RoleArn: !Ref StatesRoleArn
+      DefinitionS3Location:
+        Bucket: !Ref DefinitionBucket
+        Key: !Ref DefinitionKey
+      DefinitionSubstitutions:
+        FileValidatorArn: !Ref FileValidatorArn
+        AlertHandlerArn: !Ref AlertHandlerArn
+        AlertTopicArn: !Ref AlertTopicArn
+        RawCrawlerName: !Ref RawCrawlerName
+        EtlJobName: !Ref EtlJobName
+        DqJobName: !Ref DqJobName
+        Scd2JobName: !Ref Scd2JobName
+        DataBucket: !Ref DataBucketName
+
+Outputs:
+  StateMachineArn:
+    Value: !Ref PipelineStateMachine
+    Export: { Name: !Sub "${ProjectName}-state-machine-arn" }
+  StateMachineName:
+    Value: !GetAtt PipelineStateMachine.Name

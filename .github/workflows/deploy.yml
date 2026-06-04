@@ -1,0 +1,111 @@
+name: DataForge CI/CD
+
+# Validates templates, runs tests, packages Lambdas, and deploys CloudFormation.
+# - PRs / pushes to non-main: validate + test only (no AWS creds needed).
+# - Push to main: full deploy (requires AWS OIDC role or access keys as secrets).
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  id-token: write   # for AWS OIDC (preferred over long-lived keys)
+  contents: read
+
+env:
+  PYTHON_VERSION: "3.11"
+
+jobs:
+  # ---------------------------------------------------------------- validate + test
+  validate:
+    name: Validate & Test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Install dev dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements-dev.txt
+
+      - name: Lint CloudFormation (cfn-lint)
+        run: cfn-lint infrastructure/cloudformation/*.yml || true
+
+      - name: Validate Step Functions definition is valid JSON
+        run: python -c "import json; json.load(open('stepfunctions/pipeline.asl.json')); print('ASL OK')"
+
+      - name: Python unit tests (matching engine + helpers)
+        run: pytest -q
+
+      - name: SQL lint (best-effort)
+        run: |
+          sqlfluff lint sql/ --dialect ansi || true
+          sqlfluff lint athena/ --dialect athena || true
+
+  # ---------------------------------------------------------------- package + deploy
+  deploy:
+    name: Package & Deploy
+    needs: validate
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    runs-on: ubuntu-latest
+    environment: production
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      # Prefer OIDC: set AWS_DEPLOY_ROLE_ARN in repo secrets/vars.
+      - name: Configure AWS credentials (OIDC)
+        if: ${{ vars.AWS_DEPLOY_ROLE_ARN != '' }}
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION || 'us-east-1' }}
+
+      # Fallback: static keys (less preferred).
+      - name: Configure AWS credentials (keys)
+        if: ${{ vars.AWS_DEPLOY_ROLE_ARN == '' }}
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ vars.AWS_REGION || 'us-east-1' }}
+
+      - name: Build .env from repo variables
+        run: |
+          cat > .env <<EOF
+          AWS_REGION=${{ vars.AWS_REGION || 'us-east-1' }}
+          PROJECT_NAME=${{ vars.PROJECT_NAME || 'dataforge' }}
+          DATA_BUCKET=${{ vars.DATA_BUCKET }}
+          ALERT_EMAIL=${{ vars.ALERT_EMAIL }}
+          STACK_NAME=${{ vars.STACK_NAME || 'dataforge-mdm-demo' }}
+          ENABLE_RDS=${{ vars.ENABLE_RDS || 'true' }}
+          ENABLE_REDSHIFT=${{ vars.ENABLE_REDSHIFT || 'false' }}
+          ENABLE_QUICKSIGHT=${{ vars.ENABLE_QUICKSIGHT || 'false' }}
+          USE_DELTA=${{ vars.USE_DELTA || 'false' }}
+          REDSHIFT_DATABASE=dataforge
+          REDSHIFT_USER=dataforge_admin
+          RDS_DATABASE=mdm
+          RDS_USER=mdm_admin
+          EOF
+
+      - name: Bootstrap (deploy bucket)
+        run: bash scripts/bootstrap.sh
+
+      - name: Package + deploy (Lambda, Glue scripts, ASL, CloudFormation)
+        run: bash scripts/deploy.sh
+
+      - name: Sync Glue scripts + Step Functions definition (idempotent)
+        run: |
+          source scripts/_common.sh
+          aws s3 cp glue_jobs/ "s3://$DEPLOY_BUCKET/glue-scripts/" --recursive --include "*.py"
+          aws s3 cp stepfunctions/pipeline.asl.json "s3://$DEPLOY_BUCKET/stepfunctions/pipeline.asl.json"

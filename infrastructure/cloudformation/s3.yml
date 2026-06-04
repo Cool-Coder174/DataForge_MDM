@@ -1,0 +1,60 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  DataForge MDM - S3 data lake. Single bucket with zoned prefixes
+  (incoming/raw/processed/curated/master) + versioning on the immutable raw zone.
+
+Parameters:
+  ProjectName:
+    Type: String
+  DataBucketName:
+    Type: String
+    Description: Globally-unique bucket name for the data lake.
+
+Resources:
+  DataLakeBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      BucketName: !Ref DataBucketName
+      # Versioning gives us the "immutable raw zone" guarantee (no silent overwrites).
+      VersioningConfiguration:
+        Status: Enabled
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      LifecycleConfiguration:
+        Rules:
+          # Keep costs down: expire query results + non-current raw versions.
+          - Id: ExpireAthenaResults
+            Status: Enabled
+            Prefix: athena-results/
+            ExpirationInDays: 7
+          - Id: ExpireRejected
+            Status: Enabled
+            Prefix: processed/rejected/
+            ExpirationInDays: 30
+          - Id: TrimOldRawVersions
+            Status: Enabled
+            Prefix: raw/
+            NoncurrentVersionExpiration:
+              NoncurrentDays: 30
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+
+Outputs:
+  DataBucketName:
+    Value: !Ref DataLakeBucket
+    Export:
+      Name: !Sub "${ProjectName}-data-bucket"
+  DataBucketArn:
+    Value: !GetAtt DataLakeBucket.Arn
+    Export:
+      Name: !Sub "${ProjectName}-data-bucket-arn"
