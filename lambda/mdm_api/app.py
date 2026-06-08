@@ -227,9 +227,18 @@ def store():
 
 
 # =========================================================================== handlers
+# CORS headers so the browser dashboard (served from a different origin) can call
+# the API directly. The API is demo-scoped (AuthorizationType: NONE).
+_CORS_HEADERS = {
+    "access-control-allow-origin": "*",
+    "access-control-allow-headers": "content-type,authorization",
+    "access-control-allow-methods": "GET,POST,PUT,OPTIONS",
+}
+
+
 def _resp(code, body):
     return {"statusCode": code,
-            "headers": {"content-type": "application/json"},
+            "headers": {"content-type": "application/json", **_CORS_HEADERS},
             "body": json.dumps(body, default=str)}
 
 
@@ -366,6 +375,11 @@ def handler(event, _context):
     raw_path = event.get("path") or "/"
     path = raw_path.strip("/")
     parts = path.split("/") if path else []
+
+    # CORS preflight.
+    if method == "OPTIONS":
+        return _resp(200, {"ok": True})
+
     body = {}
     if event.get("body"):
         try:
@@ -377,7 +391,29 @@ def handler(event, _context):
         if not parts:
             return _resp(200, {"service": f"{PROJECT}-mdm-api",
                                "backend": "rds" if USE_RDS else "sqlite",
-                               "domains": list(DOMAINS)})
+                               "domains": list(DOMAINS),
+                               "extras": ["analytics", "alarms"]})
+
+        # Athena-backed analytics (BFF for the dashboard chart widgets).
+        if parts[0] == "analytics":
+            if method != "GET":
+                return _resp(405, {"error": "use GET"})
+            import analytics
+            if len(parts) == 1:
+                return _resp(200, {"queries": analytics.available_queries()})
+            name = parts[1]
+            try:
+                rows = analytics.run_named_query(name)
+            except KeyError:
+                return _resp(404, {"error": f"unknown analytics query '{name}'"})
+            return _resp(200, {"name": name, "rows": rows})
+
+        # CloudWatch alarm posture (BFF for the dashboard alert widgets).
+        if parts[0] == "alarms":
+            if method != "GET":
+                return _resp(405, {"error": "use GET"})
+            import cloudwatch
+            return _resp(200, {"alarms": cloudwatch.list_alarms()})
 
         domain = parts[0]
         if domain not in DOMAINS:

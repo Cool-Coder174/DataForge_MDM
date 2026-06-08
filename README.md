@@ -120,7 +120,14 @@ which wires up all nested stacks.
 
 ## 8. Sample data upload
 
+The sample data is sourced from the public **NYC Taxi & Limousine Commission**
+datasets ([data dictionary](https://www.nyc.gov/assets/tlc/downloads/pdf/data_dictionary_trip_records_yellow.pdf)):
+
+- Trips: [`yellow_tripdata_2025-08.parquet`](https://d37ci6vzurychx.cloudfront.net/trip-data/yellow_tripdata_2025-08.parquet) (a cleaned 2,000-row slice, native TLC schema)
+- Zones: [`taxi_zone_lookup.csv`](https://d37ci6vzurychx.cloudfront.net/misc/taxi_zone_lookup.csv) (full 265-zone master)
+
 ```bash
+python3 data/sample/_generate_taxi_sample.py   # (re)build the real sample slice
 make upload-data        # pushes data/sample/* to s3://$DATA_BUCKET/incoming/...
 ```
 
@@ -288,6 +295,52 @@ docs/                            # architecture, demo script, runbook, dictionar
    fallback path is documented for offline/local mode in `lambda/mdm_api/app.py`.
 5. Networking uses the **default VPC + public subnet** (no NAT gateway) to keep the
    demo cheap; tighten for production.
-6. Sample taxi data is a small synthetic Parquet/CSV slice so the whole pipeline
-   runs in minutes and within Free Tier-ish limits.
+6. Sample taxi data is a **real** 2,000-trip slice of the NYC TLC
+   `yellow_tripdata_2025-08.parquet` file (kept in the native TLC schema) plus
+   the official 265-row `taxi_zone_lookup.csv`, so the whole pipeline runs in
+   minutes and within Free Tier-ish limits. Regenerate/refresh it with
+   `python3 data/sample/_generate_taxi_sample.py [num_rows]` (streams just the
+   bytes it needs from the public TLC mirror via HTTP range requests).
+
+---
+
+## 18. React UI/UX Observability Dashboard
+
+An in-house React + TypeScript dashboard simulating an AWS QuickSight-style dashboard for visual and interactive monitoring of the end-to-end data platform. It runs completely locally with mock/demo data and doesn't require active AWS credentials.
+
+### Features
+- **Executive Overview**: KPI cards for total trips, revenue, average fare/distance, and data quality scores, plus charts for trips and payment methods.
+- **Pipeline Operations**: Interactive visualization of the AWS architecture node-by-node (S3 -> EventBridge -> Step Functions -> Lambda -> Glue -> RDS -> Redshift). Click nodes to view real-time latency, processed record counts, and mock CloudWatch logs.
+- **Data Quality Dashboard**: Deep dive into schema validations, null checks, duplicate checks, and field ranges. Inspect sample bad records (negative fares, dropoffs before pickups).
+- **Data Lake Explorer**: Visual interface for inspecting S3 zones (`raw/`, `processed/`, `curated/`, `master/`) including partitions, file sizes, schema drift, and data movement.
+- **Master Data Management**: MDM golden records, merge/split simulator, duplicate resolution candidates, survivorship rule configurations, and audit trail simulation.
+- **Analytics & Reporting**: QuickSight-style interactive analytical views showing peak booking hours, weekday distributions, and zone-to-zone routing.
+- **Audit & Compliance**: Visual lineage charts, IAM permission reviews, KMS key/Secrets Manager status logs, and active CloudWatch alarms.
+- **Demo Control Panel**: Trigger live scenarios (Healthy Pipeline, Bad Source File, Glue Job Failure, IAM Permission Denied, KMS Decrypt Failure, Schema Drift, RDS Record Mismatch) and watch the entire dashboard dynamically update its state to reflect the system's condition.
+
+### Setup and Running the Dashboard
+
+1. Navigate to the `dashboard` directory:
+   ```bash
+   cd dashboard
+   ```
+2. Install dependencies:
+   ```bash
+   npm install
+   ```
+3. Run the development server:
+   ```bash
+   npm run dev
+   ```
+4. Open your browser and navigate to `http://localhost:5173` (or the port specified in your terminal).
+
+### Production Build and Verification
+
+Ensure the build and linter are passing:
+```bash
+# Build the production bundle
+npm run build
+
+# Run TypeScript compilation and ESLint linter
+npm run lint
 ```

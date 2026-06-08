@@ -29,6 +29,12 @@ Parameters:
   RdsProxyEndpoint:
     Type: String
     Default: ""
+  CuratedDatabaseName:
+    Type: String
+    Default: dataforge_curated
+  AthenaWorkgroup:
+    Type: String
+    Default: primary
 
 Resources:
   FileValidatorFunction:
@@ -69,6 +75,11 @@ Resources:
           # When RDS is disabled, the function transparently falls back to an
           # in-memory/SQLite store so the API still demos. See app.py.
           MDM_FALLBACK: "sqlite"
+          # Athena BFF analytics route (GET /analytics/{name}). Results land in
+          # s3://${DATA_BUCKET}/athena-results/ (7-day lifecycle, see s3.yml).
+          CURATED_DB: !Ref CuratedDatabaseName
+          ATHENA_OUTPUT: !Sub "s3://${DataBucketName}/athena-results/"
+          ATHENA_WORKGROUP: !Ref AthenaWorkgroup
 
   AlertHandlerFunction:
     Type: AWS::Lambda::Function

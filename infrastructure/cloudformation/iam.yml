@@ -68,10 +68,14 @@ Resources:
                 Action: [sns:Publish]
                 Resource: !Sub "arn:aws:sns:*:${AWS::AccountId}:${ProjectName}-alerts"
               - Effect: Allow
-                Action: [athena:StartQueryExecution, athena:GetQueryExecution, athena:GetQueryResults]
+                Action: [athena:StartQueryExecution, athena:GetQueryExecution, athena:GetQueryResults, athena:StopQueryExecution]
                 Resource: "*"
               - Effect: Allow
                 Action: [glue:GetTable, glue:GetDatabase, glue:GetPartitions]
+                Resource: "*"
+              # Read-only CloudWatch access for the dashboard /alarms BFF route.
+              - Effect: Allow
+                Action: [cloudwatch:DescribeAlarms, cloudwatch:DescribeAlarmHistory, cloudwatch:GetMetricData]
                 Resource: "*"
 
   # ---------------------------------------------------------------- Step Functions

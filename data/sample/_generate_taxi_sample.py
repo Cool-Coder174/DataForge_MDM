@@ -1,85 +1,155 @@
 #!/usr/bin/env python3
-"""Generate a small, realistic NYC Yellow Taxi sample.
+"""Build the demo's sample data from the REAL NYC TLC public datasets.
 
-Always writes yellow_taxi_sample.csv. Also writes yellow_taxi_sample.parquet when
-pyarrow is available (preferred input for the Glue ETL). All vendor_id and
-location ids reference rows present in vendors.csv / taxi_zones.csv so the
-GOOD-path run passes referential-integrity checks.
+Sources (NYC Taxi & Limousine Commission, public CloudFront mirror):
+  - Trip records : yellow_tripdata_2025-08.parquet
+  - Zone lookup  : taxi_zone_lookup.csv
+  - Data dict.   : data_dictionary_trip_records_yellow.pdf (schema reference)
 
-Usage:  python3 data/sample/_generate_taxi_sample.py [num_rows]
+What it writes into data/sample/:
+  - taxi_zones.csv          full 265-zone TLC lookup (+ a few intentionally
+                            "dirty" duplicate rows so the MDM fuzzy-matching
+                            demo still has something to dedupe).
+  - yellow_taxi_sample.parquet / .csv
+                            a cleaned, deterministic slice of the real trip
+                            file, kept in the native TLC schema (VendorID,
+                            tpep_pickup_datetime, PULocationID, ...). Rows are
+                            filtered so the GOOD-path data-quality gate passes
+                            (valid fares/times, known vendors, known zones,
+                            de-duplicated).
+
+The real trip file is ~62 MB / 3.5M rows. Rather than download all of it, we
+stream just the bytes pyarrow needs (footer + the first row group) over HTTP
+range requests via _remote_parquet.HTTPRangeFile.
+
+Usage:
+    python3 data/sample/_generate_taxi_sample.py [num_rows]   # default 2000
 """
 from __future__ import annotations
 
 import csv
-import datetime as dt
+import io
 import pathlib
-import random
 import sys
 
+import requests
+
 HERE = pathlib.Path(__file__).resolve().parent
+ZONES_OUT = HERE / "taxi_zones.csv"
 CSV_OUT = HERE / "yellow_taxi_sample.csv"
 PARQUET_OUT = HERE / "yellow_taxi_sample.parquet"
 
-VENDOR_IDS = [1, 2, 6, 7]
-ZONE_IDS = [4, 13, 24, 41, 43, 48, 68, 79, 87, 90, 100, 107, 113, 125, 137,
-            140, 141, 142, 143, 144, 148, 161, 162, 163, 164, 170, 186, 230,
-            231, 234, 236, 237, 238, 239, 7, 70, 138, 132, 33, 65, 255]
-PAYMENT_TYPES = [1, 2, 3, 4]
+TLC_BASE = "https://d37ci6vzurychx.cloudfront.net"
+TRIPS_URL = f"{TLC_BASE}/trip-data/yellow_tripdata_2025-08.parquet"
+ZONES_URL = f"{TLC_BASE}/misc/taxi_zone_lookup.csv"
 
-HEADER = [
-    "vendor_id", "tpep_pickup_datetime", "tpep_dropoff_datetime",
-    "passenger_count", "trip_distance", "pu_location_id", "do_location_id",
-    "fare_amount", "tip_amount", "total_amount", "payment_type",
+# Vendors present in our master (data/sample/vendors.csv + mdm seed).
+KNOWN_VENDORS = {1, 2, 6, 7}
+# Real "Unknown" / "Outside of NYC" sentinel zones we exclude from clean trips.
+EXCLUDED_ZONES = {264, 265}
+
+# A few deliberately messy duplicates appended to the real zone lookup so the
+# MDM dedup / fuzzy-match demo has realistic near-duplicate rows to resolve.
+DIRTY_ZONE_DUPES = [
+    (161, "Manhattan", "Midtown Cntr", "Yellow Zone"),       # abbreviation
+    (237, "Manhattan", "UES South", "Yellow Zone"),          # abbreviation
+    (7,   "Queens",    "Astoria ", "Boro Zone"),             # trailing space
+    (132, "Queens",    "J.F.K. Airport", "Airports"),        # punctuation
 ]
 
 
-def generate(n: int):
-    rng = random.Random(42)  # deterministic
-    base = dt.datetime(2024, 1, 15, 0, 0, 0)
-    rows = []
-    for _ in range(n):
-        pickup = base + dt.timedelta(minutes=rng.randint(0, 60 * 24 * 5))
-        dur = rng.randint(3, 55)
-        dropoff = pickup + dt.timedelta(minutes=dur)
-        dist = round(rng.uniform(0.4, 18.0), 2)
-        fare = round(3.0 + dist * rng.uniform(2.0, 3.5), 2)
-        tip = round(fare * rng.choice([0, 0, 0.1, 0.15, 0.2, 0.25]), 2)
-        total = round(fare + tip + 1.0, 2)  # +mta/improvement surcharge
-        rows.append([
-            rng.choice(VENDOR_IDS),
-            pickup.strftime("%Y-%m-%d %H:%M:%S"),
-            dropoff.strftime("%Y-%m-%d %H:%M:%S"),
-            rng.randint(1, 5),
-            dist,
-            rng.choice(ZONE_IDS),
-            rng.choice(ZONE_IDS),
-            fare,
-            tip,
-            total,
-            rng.choice(PAYMENT_TYPES),
-        ])
-    return rows
+# --------------------------------------------------------------------------- zones
+def build_zones() -> set[int]:
+    """Fetch the real TLC zone lookup, write it out, append dirty dupes.
+
+    Returns the set of valid (clean) LocationIDs used to filter trips.
+    """
+    resp = requests.get(ZONES_URL, timeout=60)
+    resp.raise_for_status()
+    reader = csv.DictReader(io.StringIO(resp.text))
+    rows = list(reader)
+
+    valid_ids: set[int] = set()
+    with ZONES_OUT.open("w", newline="") as fh:
+        w = csv.writer(fh)
+        w.writerow(["LocationID", "Borough", "Zone", "service_zone"])
+        for r in rows:
+            loc = int(r["LocationID"])
+            w.writerow([loc, r["Borough"], r["Zone"], r["service_zone"]])
+            if loc not in EXCLUDED_ZONES:
+                valid_ids.add(loc)
+        for loc, borough, zone, sz in DIRTY_ZONE_DUPES:
+            w.writerow([loc, borough, zone, sz])
+
+    print(f"wrote {len(rows)} real zones (+{len(DIRTY_ZONE_DUPES)} dirty dupes) -> {ZONES_OUT}")
+    return valid_ids
+
+
+# --------------------------------------------------------------------------- trips
+def build_trips(n: int, valid_zone_ids: set[int]) -> None:
+    import pandas as pd
+    import pyarrow.parquet as pq
+
+    from _remote_parquet import HTTPRangeFile
+
+    print(f"streaming real trips from {TRIPS_URL} ...")
+    src = HTTPRangeFile(TRIPS_URL)
+    pf = pq.ParquetFile(src)
+    # The first row group (~1M rows) is plenty to draw a clean sample from.
+    df = pf.read_row_group(0).to_pandas()
+    print(f"  read row group 0: {len(df):,} raw rows")
+
+    pickup = pd.to_datetime(df["tpep_pickup_datetime"])
+    dropoff = pd.to_datetime(df["tpep_dropoff_datetime"])
+
+    mask = (
+        df["VendorID"].isin(KNOWN_VENDORS)
+        & pickup.notna() & dropoff.notna()
+        & (dropoff > pickup)
+        # keep trips within the file's reference month (Aug 2025)
+        & (pickup.dt.year == 2025) & (pickup.dt.month == 8)
+        & df["PULocationID"].isin(valid_zone_ids)
+        & df["DOLocationID"].isin(valid_zone_ids)
+        & df["fare_amount"].notna() & (df["fare_amount"] >= 0)
+        & df["total_amount"].notna() & (df["total_amount"] >= 0)
+        & df["passenger_count"].notna() & (df["passenger_count"] >= 1)
+        & df["trip_distance"].notna() & (df["trip_distance"] > 0)
+    )
+    clean = df[mask].copy()
+    clean = clean.drop_duplicates(
+        subset=["VendorID", "tpep_pickup_datetime", "tpep_dropoff_datetime",
+                "PULocationID", "DOLocationID"]
+    )
+    print(f"  {len(clean):,} rows pass the data-quality filters")
+
+    if len(clean) < n:
+        raise SystemExit(f"only {len(clean)} clean rows available; lower num_rows")
+
+    sample = clean.sample(n=n, random_state=42).reset_index(drop=True)
+    sample = sample.sort_values("tpep_pickup_datetime").reset_index(drop=True)
+
+    # Cast the integer-ish columns back to clean nullable ints.
+    sample["VendorID"] = sample["VendorID"].astype("int64")
+    sample["passenger_count"] = sample["passenger_count"].astype("int64")
+    sample["PULocationID"] = sample["PULocationID"].astype("int64")
+    sample["DOLocationID"] = sample["DOLocationID"].astype("int64")
+    sample["payment_type"] = sample["payment_type"].astype("int64")
+
+    sample.to_parquet(PARQUET_OUT, index=False)
+    print(f"wrote {len(sample):,} real trips -> {PARQUET_OUT}")
+    sample.to_csv(CSV_OUT, index=False)
+    print(f"wrote {len(sample):,} real trips -> {CSV_OUT}")
+
+    # Quick provenance summary for the demo.
+    rev = sample["total_amount"].sum()
+    print(f"  vendors={sorted(sample['VendorID'].unique().tolist())} "
+          f"revenue=${rev:,.2f} avg_fare=${sample['fare_amount'].mean():.2f}")
 
 
 def main() -> None:
-    n = int(sys.argv[1]) if len(sys.argv) > 1 else 500
-    rows = generate(n)
-
-    with CSV_OUT.open("w", newline="") as fh:
-        w = csv.writer(fh)
-        w.writerow(HEADER)
-        w.writerows(rows)
-    print(f"wrote {len(rows)} rows -> {CSV_OUT}")
-
-    try:
-        import pandas as pd
-        df = pd.DataFrame(rows, columns=HEADER)
-        df["tpep_pickup_datetime"] = pd.to_datetime(df["tpep_pickup_datetime"])
-        df["tpep_dropoff_datetime"] = pd.to_datetime(df["tpep_dropoff_datetime"])
-        df.to_parquet(PARQUET_OUT, index=False)
-        print(f"wrote parquet -> {PARQUET_OUT}")
-    except Exception as exc:  # noqa: BLE001
-        print(f"(parquet skipped: {exc}; CSV fallback will be used)")
+    n = int(sys.argv[1]) if len(sys.argv) > 1 else 2000
+    valid_zone_ids = build_zones()
+    build_trips(n, valid_zone_ids)
 
 
 if __name__ == "__main__":

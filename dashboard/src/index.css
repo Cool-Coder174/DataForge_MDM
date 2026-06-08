@@ -1,0 +1,62 @@
+@import "tailwindcss";
+@config "../tailwind.config.js";
+
+/* Refined dark-first enterprise theme. Defaults to dark; light is available
+   via the topbar toggle. */
+html.dark {
+  color-scheme: dark;
+}
+
+body {
+  @apply bg-zinc-50 text-zinc-900 dark:bg-canvas dark:text-zinc-100 antialiased;
+  font-family: theme('fontFamily.sans');
+  font-feature-settings: "liga" 1, "calt" 1, "cv01" 1, "ss01" 1;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  text-rendering: optimizeLegibility;
+}
+
+/* Tabular figures for metrics, tables, and timestamps keep numbers aligned. */
+.tabular-nums {
+  font-variant-numeric: tabular-nums;
+}
+
+/* Accessible keyboard focus ring (WCAG 2.4.7). */
+:where(a, button, select, input, textarea, [role="button"], [role="tab"], [tabindex]):focus-visible {
+  outline: 2px solid theme('colors.brand.400');
+  outline-offset: 2px;
+  border-radius: 6px;
+}
+
+::selection {
+  background-color: rgba(59, 130, 246, 0.30);
+}
+
+/* Custom scrollbars tuned for the dark surfaces. */
+::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+::-webkit-scrollbar-thumb {
+  @apply bg-zinc-300 dark:bg-darkBorder rounded-full;
+  border: 2px solid transparent;
+  background-clip: padding-box;
+}
+::-webkit-scrollbar-thumb:hover {
+  @apply bg-zinc-400 dark:bg-zinc-600;
+  background-clip: padding-box;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
+  }
+}

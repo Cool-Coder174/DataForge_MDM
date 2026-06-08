@@ -98,6 +98,7 @@ Resources:
         AlertTopicArn: !GetAtt MonitoringStack.Outputs.AlertTopicArn
         RdsSecretArn: !If [RdsEnabled, !GetAtt RdsStack.Outputs.RdsSecretArn, ""]
         RdsProxyEndpoint: !If [RdsEnabled, !GetAtt RdsStack.Outputs.RdsEndpoint, ""]
+        CuratedDatabaseName: !GetAtt GlueStack.Outputs.CuratedDatabaseName
 
   ApiGatewayStack:
     Type: AWS::CloudFormation::Stack
